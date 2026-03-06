@@ -25,9 +25,9 @@ Deployment target: Docker container alongside Redmine, behind an Nginx reverse p
 ## Architecture Summary
 
 - **Transport**: HTTP with SSE (Server-Sent Events) — no stdio
-- **Auth**: OAuth2 Client Credentials flow (per-user client_id/client_secret)
-  - Each user registers a client_id + client_secret with the MCP server
-  - The server maps those credentials to a Redmine API key
+- **Auth**: OAuth 2.1 Authorization Code + PKCE via Ory Hydra sidecar (planned — MCP tools implemented first)
+  - Hydra handles all OAuth token machinery; rrmcp validates tokens via Hydra introspection
+  - Each user's Redmine API key is stored in SQLite, looked up by user identity from the token
   - All Redmine API calls use the resolved per-user API key
 - **User registry**: SQLite database (via `sqlx`), persisted as a Docker volume
 - **Redmine connection**: Single self-hosted Redmine instance via REST API + API key per user
@@ -62,27 +62,28 @@ All configuration is via environment variables for Docker compatibility.
 
 ## User Registry (SQLite)
 
-Database persisted via Docker volume at `/data/rrmcp.db` (managed by `sqlx` migrations).
+Database persisted via Docker volume (managed by `sqlx` migrations).
 
 Schema:
 
 ```sql
-CREATE TABLE users (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    client_id       TEXT NOT NULL UNIQUE,
-    client_secret   TEXT NOT NULL,  -- hashed (argon2)
-    redmine_api_key TEXT NOT NULL,
-    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+CREATE TABLE user_api_keys (
+    user_id                   TEXT PRIMARY KEY,       -- email address
+    password_hash             TEXT,                   -- argon2 hashed
+    redmine_api_key_encrypted TEXT NOT NULL,          -- AES-256-GCM encrypted
+    redmine_user_login        TEXT,                   -- optional, for reference
+    created_at                DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at                DATETIME
 );
 ```
 
 Users are managed via CLI subcommand (run inside the container):
 
 ```bash
-rrmcp user add --client-id alice --client-secret s3cr3t --redmine-api-key abc123
-rrmcp user remove --client-id alice
+rrmcp user add alice@example.com --api-key abc123
+rrmcp user remove alice@example.com
 rrmcp user list
+rrmcp user set-api-key alice@example.com new-key
 ```
 
 ## Code Conventions

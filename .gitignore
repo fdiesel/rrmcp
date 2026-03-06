@@ -1,3 +1,5 @@
 /target/
 /.claude/skills/backlog/
-/**/*.local.*
+*.local.*
+*.env
+*.env.*

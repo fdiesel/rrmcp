@@ -2,24 +2,31 @@
 
 ## Overview
 
-rrmcp is a stateless HTTP MCP server that bridges AI assistants (Claude.ai) to a self-hosted
-Redmine instance. It is multi-user: each user authenticates with their own OAuth2 credentials,
-which map server-side to their personal Redmine API key.
+rrmcp is an HTTP MCP server that bridges AI assistants (Claude.ai) to a self-hosted Redmine
+instance. It is multi-user: each user authenticates via OAuth 2.1, which maps server-side to
+their personal Redmine API key.
+
+> **Note:** MCP tool implementation is the primary focus. OAuth 2.1 authentication (via Ory
+> Hydra) is planned but may be added in a later phase. The architecture below reflects the
+> intended final design.
 
 ```
 Claude.ai
   │
-  │  HTTPS (OAuth2 Client Credentials)
+  │  HTTPS (OAuth 2.1 + PKCE)
   ▼
 Nginx (TLS termination + reverse proxy)
   │
-  │  HTTP
-  ▼
-rrmcp MCP Server (Docker container, port 3000)
+  ├──► Ory Hydra (OAuth token endpoints)
+  │       │
+  │       ├──► Login/Consent App (login UI, user → API key registry)
+  │       └──► SQLite (hydra.sqlite — Hydra's own state)
   │
-  │  HTTPS (Redmine REST API + per-user API key)
-  ▼
-Redmine (Docker container)
+  └──► rrmcp MCP Server
+          │  introspects token via Hydra
+          │  looks up API key in SQLite
+          ▼
+       Redmine (HTTPS, per-user API key)
 ```
 
 ## Transport
@@ -30,55 +37,84 @@ Redmine (Docker container)
 
 ## Authentication & Authorization
 
-### Flow
+> **Status**: OAuth implementation is planned. MCP tools are implemented first and may
+> initially run without auth (or with a simpler API key check) until Hydra integration is
+> complete.
 
-1. User configures Claude.ai with:
-   - MCP Server URL (e.g. `https://mcp.example.com`)
-   - OAuth Client ID (their personal `client_id`)
-   - OAuth Client Secret (their personal `client_secret`)
+### Intended Flow (OAuth 2.1 via Ory Hydra)
 
-2. Claude.ai sends an OAuth2 **Client Credentials** grant request to the MCP server:
+1. Admin creates an OAuth client in Hydra:
+   ```bash
+   docker exec hydra hydra create oauth2-client \
+     --name "Claude.ai" \
+     --grant-type authorization_code,refresh_token \
+     --response-type code \
+     --redirect-uri "https://claude.ai/oauth/callback"
    ```
-   POST /oauth/token
-   grant_type=client_credentials&client_id=...&client_secret=...
+
+2. Admin registers a user with their Redmine API key:
+   ```bash
+   rrmcp user add alice@example.com --api-key <redmine-api-key>
    ```
 
-3. The server validates credentials against the user registry, issues a short-lived JWT or
-   opaque bearer token, and stores the association: token → redmine_api_key.
+3. User configures Claude.ai with:
+   - Server URL: `https://your-server.com`
+   - Client ID: (from step 1)
+   - Client Secret: (from step 1)
 
-4. Subsequent MCP requests include the bearer token. The server resolves the Redmine API key
-   and uses it for all Redmine REST calls on behalf of that user.
+4. Claude.ai initiates the Authorization Code + PKCE flow via Hydra. The user logs in through
+   the Login/Consent App, which accepts the request via the Hydra Admin API.
+
+5. Claude.ai exchanges the auth code for a bearer token, then sends MCP requests with it.
+
+6. rrmcp introspects the token via Hydra, resolves the user's Redmine API key from SQLite, and
+   calls Redmine on their behalf.
 
 ### User Registry
 
-Stored in SQLite (via `sqlx`), persisted as a Docker volume at `/data/rrmcp.db`.
-Migrations run automatically at startup.
+Stored in SQLite (via `sqlx`), persisted as a Docker volume. Managed by the Login/Consent App
+and the `rrmcp user` CLI.
 
 ```sql
-CREATE TABLE users (
-    id              INTEGER PRIMARY KEY AUTOINCREMENT,
-    client_id       TEXT NOT NULL UNIQUE,
-    client_secret   TEXT NOT NULL,  -- hashed with argon2
-    redmine_api_key TEXT NOT NULL,
-    created_at      TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
+CREATE TABLE user_api_keys (
+    user_id                  TEXT PRIMARY KEY,       -- email address
+    password_hash            TEXT,                   -- argon2 hashed
+    redmine_api_key_encrypted TEXT NOT NULL,         -- AES-256-GCM encrypted
+    redmine_user_login       TEXT,                   -- optional, for reference
+    created_at               DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at               DATETIME
 );
 ```
 
-Users are managed via CLI subcommand (run inside the container — no restart needed):
+Note: Hydra manages its own state in a separate SQLite file (`hydra.sqlite`).
+
+### CLI Commands
 
 ```bash
-rrmcp user add --client-id alice --client-secret s3cr3t --redmine-api-key abc123
-rrmcp user remove --client-id alice
+# User / API key management (rrmcp CLI)
+rrmcp user add <email> --api-key <redmine_api_key> [--password <password>]
 rrmcp user list
+rrmcp user remove <email>
+rrmcp user set-api-key <email> <new_api_key>
+
+# OAuth client management (via Hydra CLI)
+docker exec hydra hydra create oauth2-client ...
+docker exec hydra hydra list oauth2-clients
+docker exec hydra hydra delete oauth2-client <client_id>
 ```
 
-### Token Issuance
+### Why Ory Hydra
 
-- Issue short-lived bearer tokens (JWT recommended, signed with a server secret)
-- Token contains: `user_id` (or `client_id`), `exp`
-- Server resolves Redmine API key from user registry using `client_id` from token claims
-- No persistent token storage needed if using stateless JWT
+| Aspect        | Ory Hydra           | Build in Rust       | Keycloak            |
+| ------------- | ------------------- | ------------------- | ------------------- |
+| Image size    | ~5 MB               | —                   | ~400 MB             |
+| RAM           | ~200 MB             | ~100 MB             | ~2 GB minimum       |
+| Database      | SQLite / PostgreSQL  | SQLite              | PostgreSQL/MySQL    |
+| OAuth spec    | OpenID Certified    | DIY                 | OpenID Certified    |
+| Security risk | Low (battle-tested) | Higher              | Low                 |
+
+Hydra handles all OAuth 2.1 machinery (PKCE, token introspection, revocation, discovery
+metadata) so rrmcp only needs to validate tokens — not issue them.
 
 ## Module Structure (Planned)
 
@@ -87,16 +123,30 @@ src/
   main.rs           — Entry point: clap dispatch to `serve` or `user` subcommand
   config.rs         — Environment variable config structs
   auth/
-    mod.rs          — OAuth2 token endpoint handler
-    token.rs        — JWT issuance and validation
+    mod.rs          — Bearer token validation middleware (Hydra introspection)
     registry.rs     — User registry (sqlx queries against SQLite)
   redmine/
     mod.rs          — Redmine API client (reqwest-based)
-    models.rs       — Serde structs for all Redmine resources
     issues.rs       — Issues API
     projects.rs     — Projects API
     wiki.rs         — Wiki Pages API
-    ... (one file per major resource group)
+    time_entries.rs — Time Entries API
+    users.rs        — Users API
+    attachments.rs  — Attachments / Uploads API
+    search.rs       — Search API
+    groups.rs       — Groups API
+    versions.rs     — Versions API
+    memberships.rs  — Project Memberships API
+    relations.rs    — Issue Relations API
+    categories.rs   — Issue Categories API
+    journals.rs     — Journals API
+    enumerations.rs — Enumerations API
+    custom_fields.rs— Custom Fields API
+    roles.rs        — Roles API
+    queries.rs      — Queries API
+    news.rs         — News API
+    files.rs        — Files API
+    my_account.rs   — My Account API
   tools/
     mod.rs          — MCP tool registration with rmcp
     issues.rs       — MCP tools wrapping Redmine issue calls
@@ -105,7 +155,7 @@ src/
   cli/
     mod.rs          — clap App definition: `serve` + `user` subcommands
     serve.rs        — `rrmcp serve`: HTTP server startup, config loading, router setup
-    user.rs         — `rrmcp user add/remove/list` subcommands
+    user.rs         — `rrmcp user add/remove/list/set-api-key` subcommands
   error.rs          — thiserror error types
 ```
 
@@ -130,28 +180,58 @@ src/
 services:
   redmine:
     image: redmine:latest
-    # ...
+    # ... your existing Redmine config
+
+  hydra:
+    image: oryd/hydra:v2.2.0
+    command: serve all
+    environment:
+      DSN: sqlite:///data/hydra.sqlite?_fk=true
+      URLS_SELF_ISSUER: https://your-server.com
+      URLS_LOGIN: http://login-app:3001/login
+      URLS_CONSENT: http://login-app:3001/consent
+      URLS_LOGOUT: http://login-app:3001/logout
+      SECRETS_SYSTEM: ${HYDRA_SECRET}
+    volumes:
+      - hydra-data:/data
+    # ports 4444 (public) and 4445 (admin) — internal only, Nginx proxies 4444
+
+  login-app:
+    build: ./login-app
+    environment:
+      HYDRA_ADMIN_URL: http://hydra:4445
+      DATABASE_PATH: /data/users.db
+    volumes:
+      - user-data:/data
 
   rrmcp:
     build: .
     environment:
       REDMINE_BASE_URL: http://redmine:3000
       MCP_SERVER_PORT: 3000
-      DATABASE_PATH: /data/rrmcp.db
+      DATABASE_PATH: /data/users.db
+      HYDRA_PUBLIC_URL: http://hydra:4444
     volumes:
-      - rrmcp_data:/data
+      - user-data:/data
     ports:
       - "3000:3000"  # internal only, Nginx proxies
 
   nginx:
     image: nginx:alpine
-    # TLS termination, proxy to rrmcp:3000
+    # TLS termination; proxy /oauth2/* and /.well-known/* to hydra:4444, rest to rrmcp:3000
+
+volumes:
+  hydra-data:
+  user-data:
 ```
 
 ## Security Considerations
 
-- Never log Redmine API keys or OAuth secrets
-- Client secrets stored as argon2 hashes in SQLite — never in plaintext
-- JWT signing secret loaded from env var, never hardcoded
-- Nginx must enforce HTTPS — the MCP server itself speaks plain HTTP internally
-- Users file mounted read-only in Docker
+- Never log Redmine API keys, OAuth secrets, or bearer tokens
+- Redmine API keys encrypted at rest with AES-256-GCM
+- User passwords hashed with argon2
+- PKCE required (enforced by Hydra)
+- JWT signing secrets loaded from env vars, never hardcoded
+- Nginx must enforce HTTPS — all internal services speak plain HTTP
+- Token introspection on every MCP request (no stale token reuse)
+- Hydra secrets stored as env vars (or secrets manager in production)

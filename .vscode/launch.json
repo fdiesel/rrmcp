@@ -1,0 +1,24 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "type": "lldb",
+      "request": "launch",
+      "name": "rrmcp serve",
+      "cargo": {
+        "args": ["build", "--bin=rrmcp", "--package=rrmcp"],
+        "filter": {
+          "name": "rrmcp",
+          "kind": "bin"
+        }
+      },
+      "args": ["serve"],
+      "cwd": "${workspaceFolder}",
+      "envFile": "${workspaceFolder}/.env",
+      "env": {
+        "MCP_SERVER_HOST": "127.0.0.1"
+      },
+      "sourceLanguages": ["rust"]
+    }
+  ]
+}

@@ -1,0 +1,25 @@
+services:
+  redmine:
+    image: redmine
+    volumes:
+      - files:/usr/src/redmine/files
+      - sqlite:/usr/src/redmine/sqlite
+    environment:
+      REDMINE_SECRET_KEY_BASE: devsecretkey
+    ports:
+      - "3001:3000"
+
+  inspector:
+    image: node:22-alpine
+    command: npx --yes @modelcontextprotocol/inspector
+    ports:
+      - "6274:6274"
+      - "3002:3002"
+    environment:
+      HOST: 0.0.0.0
+      CLIENT_PORT: 6274
+      SERVER_PORT: 3002
+
+volumes:
+  files:
+  sqlite:
