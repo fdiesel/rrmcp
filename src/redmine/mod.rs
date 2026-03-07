@@ -26,7 +26,7 @@ impl RedmineClient {
         )
     }
 
-    pub async fn read<T>(&self, path: &str, api_key: &str) -> Result<T, RedmineError>
+    pub async fn read<T>(&self, path: &str, api_key: &str) -> Result<String, RedmineError>
     where
         T: serde::de::DeserializeOwned,
     {
@@ -37,9 +37,7 @@ impl RedmineClient {
             .send()
             .await?;
         let text = Self::check_response(res).await?;
-        let parsed: T = serde_json::from_str(&text)
-            .map_err(|e| RedmineError::UnexpectedResponse(e.to_string()))?;
-        Ok(parsed)
+        Ok(text)
     }
 
     pub fn get(&self, path: &str, api_key: &str) -> RequestBuilder {

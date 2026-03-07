@@ -1,10 +1,7 @@
-use rmcp::{
-    handler::server::{tool::ToolRouter, wrapper::Parameters},
-    tool, tool_router,
-};
+use rmcp::{handler::server::tool::ToolRouter, tool, tool_router};
 
 use super::RedmineServer;
-use crate::redmine::projects::{ProjectCreate, ProjectListResponse};
+use crate::{error::RedmineError, redmine::projects::ProjectListResponse};
 
 #[tool_router(router = project_tool_router)]
 impl RedmineServer {
@@ -13,16 +10,17 @@ impl RedmineServer {
     }
 
     #[tool(
-        description = "List Redmine projects. Returns a JSON array of projects with their IDs and names."
+        description = "List Redmine projects. Returns a JSON array of projects with their IDs and names.",
+        annotations(
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = false
+        )
     )]
-    pub async fn list_projects(&self) -> String {
-        let res = self
-            .client
+    pub async fn list_projects(&self) -> Result<String, RedmineError> {
+        self.client
             .read::<ProjectListResponse>("projects.json", &self.api_key)
-            .await;
-        match res {
-            Ok(resp) => serde_json::to_string_pretty(&resp).unwrap_or_else(|e| e.to_string()),
-            Err(e) => format!("Error fetching projects: {e}"),
-        }
+            .await
     }
 }

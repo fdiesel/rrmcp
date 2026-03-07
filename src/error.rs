@@ -1,3 +1,4 @@
+use rmcp::model::IntoContents;
 use thiserror::Error;
 
 #[derive(Debug, Error)]
@@ -19,6 +20,12 @@ pub enum RedmineError {
 
     #[error("Unexpected response: {0}")]
     UnexpectedResponse(String),
+}
+
+impl IntoContents for RedmineError {
+    fn into_contents(self) -> Vec<rmcp::model::Content> {
+        vec![rmcp::model::Content::text(self.to_string())]
+    }
 }
 
 impl RedmineError {
